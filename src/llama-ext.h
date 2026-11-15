@@ -90,6 +90,31 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// An earlier pipeline stage in another process: a decode of token ids asks cb for the input rows of every token
+// (width floats each, the hidden state the earlier stage's last layer hands on) and decodes those rows instead of the
+// tokens' embeddings. tok, pos and seq_id hold n entries (seq_id: the token's first sequence); cb writes n * width
+// floats to rows and returns false on failure, which fails the decode. width 0: the model's expanded input width
+// (n_embd_out). NULL unsets it
+typedef bool (*llama_input_rows_cb)(void * user, int32_t n, const llama_token * tok, const llama_pos * pos,
+                                    const llama_seq_id * seq_id, float * rows, int32_t width);
+LLAMA_API void llama_set_input_rows_cb(struct llama_context * ctx, llama_input_rows_cb cb, void * user);
+// The width the input rows callback is asked for
+LLAMA_API int32_t llama_input_rows_width(const struct llama_context * ctx);
+
+// The operations on the context's memory, mirrored to an earlier pipeline stage that holds its own part of it: every
+// sequence operation also calls cb (op as below), and its result joins the memory's own (false when either refuses)
+enum llama_memory_op {
+    LLAMA_MEMORY_OP_CLEAR    = 0, // seq_id: 1 = data too
+    LLAMA_MEMORY_OP_SEQ_RM   = 1,
+    LLAMA_MEMORY_OP_SEQ_CP   = 2, // seq_id -> seq_id_dst
+    LLAMA_MEMORY_OP_SEQ_KEEP = 3,
+    LLAMA_MEMORY_OP_SEQ_ADD  = 4, // shift = delta
+    LLAMA_MEMORY_OP_SEQ_DIV  = 5, // shift = d
+};
+typedef bool (*llama_memory_op_cb)(void * user, enum llama_memory_op op, llama_seq_id seq_id, llama_seq_id seq_id_dst,
+                                   llama_pos p0, llama_pos p1, llama_pos shift);
+LLAMA_API void llama_set_memory_op_cb(struct llama_context * ctx, llama_memory_op_cb cb, void * user);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

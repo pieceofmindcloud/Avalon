@@ -160,6 +160,11 @@ struct llama_context {
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
+    // a decode of token ids whose input rows an earlier stage in another process gives (llama_set_input_rows_cb)
+    int decode_input_rows(const llama_batch_ext & batch_inp);
+    void set_input_rows_cb(llama_input_rows_cb cb, void * user);
+    // wraps the memory so that each sequence operation is mirrored through cb (llama_set_memory_op_cb)
+    void set_memory_op_cb(llama_memory_op_cb cb, void * user);
 
     // the first stage of a pipeline over several GPUs (the default, LLAMA_STAGES=0 turns it off): a batch processed ubatch by ubatch, split as the
     // last stage splits it (same breaks, same n_ubatch); each step writes its layers' output into `out`
@@ -325,6 +330,12 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    // an earlier pipeline stage in another process (llama_set_input_rows_cb, llama_set_memory_op_cb)
+    llama_input_rows_cb input_rows_cb   = nullptr;
+    void *              input_rows_user = nullptr;
+    // the input rows of the last decode that took them (kept for the batch built from them)
+    std::vector<float> input_rows;
 
     // pipeline stages over several GPUs (the default, LLAMA_STAGES=0 turns it off): this context is the last stage (its device's layers, the head,
     // the outputs), stage_first the first (the layers before, the embeddings); between them the layers' output of each

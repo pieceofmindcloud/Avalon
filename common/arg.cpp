@@ -3654,6 +3654,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
     add_opt(common_arg(
+        {"--stage-prev"}, "HOST:PORT",
+        "the earlier stage of a model split by layers across processes: this context takes its input rows from it "
+        "(the token in LLAMA_STAGE_PREV_TOKEN, else LLAMA_STAGE_TOKEN)",
+        [](common_params & params, const std::string & value) {
+            params.stage_prev = value;
+        }
+    ).set_env("LLAMA_ARG_STAGE_PREV"));
+    add_opt(common_arg(
+        {"--stage-serve"}, "HOST:PORT",
+        "serve this stage's output rows to the next stage on HOST:PORT (llama-stage-server; the token in LLAMA_STAGE_TOKEN)",
+        [](common_params & params, const std::string & value) {
+            params.stage_serve = value;
+        }
+    ).set_env("LLAMA_ARG_STAGE_SERVE"));
+    add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
         "path to save slot kv cache (default: disabled)",
         [](common_params & params, const std::string & value) {
