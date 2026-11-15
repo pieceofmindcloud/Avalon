@@ -580,6 +580,47 @@ llama_model_loader::llama_model_loader(
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
 
+        // tensor data stored in other files: per tensor, a file index (-1 = this file) and an absolute offset
+        const int32_t  * ext_idx  = nullptr;
+        const uint64_t * ext_offs = nullptr;
+        size_t ext_first = 0;
+        size_t n_ext     = 0;
+        const int kid_ext_files = gguf_find_key(metadata, "general.external_data.files");
+        if (kid_ext_files >= 0) {
+            const int kid_ext_idx  = gguf_find_key(metadata, "general.external_data.tensor_files");
+            const int kid_ext_offs = gguf_find_key(metadata, "general.external_data.tensor_offsets");
+            const int64_t n_tensors_meta = gguf_get_n_tensors(metadata);
+            const auto is_arr = [&](int kid, gguf_type type) {
+                return kid >= 0 && gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(metadata, kid) == type;
+            };
+            if (!is_arr(kid_ext_files, GGUF_TYPE_STRING) || !is_arr(kid_ext_idx, GGUF_TYPE_INT32) || !is_arr(kid_ext_offs, GGUF_TYPE_UINT64) ||
+                (int64_t) gguf_get_arr_n(metadata, kid_ext_idx) != n_tensors_meta ||
+                (int64_t) gguf_get_arr_n(metadata, kid_ext_offs) != n_tensors_meta) {
+                throw std::runtime_error("invalid external tensor data metadata");
+            }
+
+            std::string dir;
+            const size_t sep = fname.find_last_of("/\\");
+            if (sep != std::string::npos) {
+                dir = fname.substr(0, sep + 1);
+            }
+
+            ext_first = files.size();
+            n_ext     = gguf_get_arr_n(metadata, kid_ext_files);
+            for (size_t i = 0; i < n_ext; i++) {
+                std::string path = gguf_get_arr_str(metadata, kid_ext_files, i);
+                const bool is_abs = !path.empty() && (path[0] == '/' || path[0] == '\\' || (path.size() > 1 && path[1] == ':'));
+                if (!is_abs) {
+                    path = dir + path;
+                }
+                files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
+            }
+            external_data = true;
+            ext_idx  = (const int32_t  *) gguf_get_arr_data(metadata, kid_ext_idx);
+            ext_offs = (const uint64_t *) gguf_get_arr_data(metadata, kid_ext_offs);
+            LLAMA_LOG_INFO("%s: tensor data in %zu external files\n", __func__, n_ext);
+        }
+
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
@@ -591,10 +632,22 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            const int64_t ti = ext_idx ? gguf_find_tensor(metadata, tensor_name.c_str()) : -1;
+            if (ti >= 0 && ext_idx[ti] >= 0) {
+                if ((size_t) ext_idx[ti] >= n_ext) {
+                    throw std::runtime_error(format("tensor '%s' names external file %d, but only %zu are listed", tensor_name.c_str(), ext_idx[ti], n_ext));
+                }
+                const uint16_t idx = (uint16_t) (ext_first + ext_idx[ti]);
+                weights_map.emplace(tensor_name, llama_tensor_weight(files[idx].get(), idx, ext_offs[ti], cur));
+            } else {
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.front().get(), 0, metadata, cur));
+            }
         }
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+        if (n_split > 1 && ext_idx) {
+            throw std::runtime_error("external tensor data is not supported with split GGUF files");
+        }
 
         // Load additional GGML contexts
         if (n_split > 1) {
@@ -1511,6 +1564,33 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
+        // with external data, a file may hold far more than this model uses (a range of a whole model):
+        // prefetch only the bytes of our tensors, never the whole file
+        std::map<uint32_t, llama_mmap::ranges> skip;
+        if (external_data) {
+            std::map<uint32_t, llama_mmap::ranges> used;
+            for (const auto & it : weights_map) {
+                used[it.second.idx].emplace_back(it.second.offs, it.second.offs + ggml_nbytes(it.second.tensor));
+            }
+            for (uint32_t idx = 0; idx < files.size(); idx++) {
+                auto & u = used[idx];
+                std::sort(u.begin(), u.end());
+                auto & s = skip[idx];
+                size_t pos = 0;
+                for (const auto & r : u) {
+                    if (r.first > pos) {
+                        s.emplace_back(pos, r.first);
+                    }
+                    pos = std::max(pos, r.second);
+                }
+                if (pos < files[idx]->size()) {
+                    s.emplace_back(pos, files[idx]->size());
+                }
+                const auto & lz = lazy.for_file(idx);
+                s.insert(s.end(), lz.begin(), lz.end());
+            }
+        }
+
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
@@ -1542,7 +1622,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 #endif
                 return arena || (d && atoi(d) != 0);
             }();
-            llama_mmap::ranges no_prefetch = lazy.for_file(idx);
+            llama_mmap::ranges no_prefetch = external_data ? skip[idx] : lazy.for_file(idx);
             if (experts_direct) {
                 for (const auto & [name, w] : weights_map) {
                     if (w.idx == idx && name.find("_exps") != std::string::npos) {
