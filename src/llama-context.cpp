@@ -154,6 +154,66 @@ struct llama_memory_stage_pair : public llama_memory_i {
     }
 };
 
+// the memory of a context whose earlier layers run in another process: each sequence operation is mirrored there
+// through the callback of llama_set_memory_op_cb
+struct llama_memory_mirrored : public llama_memory_i {
+    llama_memory_ptr own;
+    llama_memory_op_cb cb;
+    void * user;
+
+    llama_memory_mirrored(llama_memory_ptr own, llama_memory_op_cb cb, void * user) : own(std::move(own)), cb(cb), user(user) {}
+
+    bool mirror(llama_memory_op op, llama_seq_id s0, llama_seq_id s1, llama_pos p0, llama_pos p1, llama_pos shift) const {
+        return !cb || cb(user, op, s0, s1, p0, p1, shift);
+    }
+
+    llama_memory_context_ptr init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) override {
+        return own->init_batch(balloc, n_ubatch, embd_all);
+    }
+    llama_memory_context_ptr init_full() override { return own->init_full(); }
+    llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override { return own->init_update(lctx, optimize); }
+
+    bool get_can_shift() const override { return own->get_can_shift(); }
+
+    void clear(bool data) override { own->clear(data); mirror(LLAMA_MEMORY_OP_CLEAR, data ? 1 : 0, -1, -1, -1, 0); }
+
+    void get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const override { own->get_lendable_kv(out); }
+    void set_kv_lent_from(uint32_t rows) override { own->set_kv_lent_from(rows); }
+    void sync_device(ggml_backend_sched_t sched) override { own->sync_device(sched); }
+
+    bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override {
+        const bool a = own->seq_rm(seq_id, p0, p1);
+        // the earlier stage removes only what this one could: a refused partial removal leaves both as they were
+        return a && mirror(LLAMA_MEMORY_OP_SEQ_RM, seq_id, -1, p0, p1, 0);
+    }
+    void seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) override {
+        own->seq_cp(src, dst, p0, p1);
+        mirror(LLAMA_MEMORY_OP_SEQ_CP, src, dst, p0, p1, 0);
+    }
+    void seq_keep(llama_seq_id seq_id) override { own->seq_keep(seq_id); mirror(LLAMA_MEMORY_OP_SEQ_KEEP, seq_id, -1, -1, -1, 0); }
+    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override {
+        own->seq_add(seq_id, p0, p1, shift);
+        mirror(LLAMA_MEMORY_OP_SEQ_ADD, seq_id, -1, p0, p1, shift);
+    }
+    void seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) override {
+        own->seq_div(seq_id, p0, p1, d);
+        mirror(LLAMA_MEMORY_OP_SEQ_DIV, seq_id, -1, p0, p1, d);
+    }
+
+    llama_pos seq_pos_min(llama_seq_id seq_id) const override { return own->seq_pos_min(seq_id); }
+    llama_pos seq_pos_max(llama_seq_id seq_id) const override { return own->seq_pos_max(seq_id); }
+
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override { return own->memory_breakdown(); }
+
+    // the earlier stage's part of a sequence is not in this state: a saved state restores on a whole model only
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const override {
+        own->state_write(io, seq_id, flags);
+    }
+    void state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        own->state_read(io, seq_id, flags);
+    }
+};
+
 // pipeline stages: LLAMA_STAGES_FULL_UBATCH_FROM=N (tokens; 0 / unset: the ubatch always halved, as before)
 static uint32_t llama_stage_full_ubatch_from() {
     static const uint32_t v = getenv("LLAMA_STAGES_FULL_UBATCH_FROM") ? (uint32_t) atoll(getenv("LLAMA_STAGES_FULL_UBATCH_FROM")) : 0;
@@ -2578,6 +2638,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+
+    // an earlier stage in another process: its rows for these tokens replace their embeddings
+    if (input_rows_cb && batch_inp.tokens.front().id != LLAMA_TOKEN_NULL && !batch_inp.tokens.front().has_embd) {
+        return decode_input_rows(batch_inp);
     }
 
     // an expanded hidden state (n_embd_out wide, e.g. the hc streams) is also accepted as input
@@ -5506,6 +5571,68 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+int llama_context::decode_input_rows(const llama_batch_ext & batch_inp) {
+    const int32_t width = (int32_t) model.hparams.n_embd_out();
+    const int32_t n = (int32_t) batch_inp.tokens.size();
+    std::vector<llama_token> tok(n);
+    std::vector<llama_pos> pos(n);
+    std::vector<llama_seq_id> seq(n);
+    for (int32_t i = 0; i < n; ++i) {
+        const auto & t = batch_inp.tokens[i];
+        if (t.id == LLAMA_TOKEN_NULL || t.has_embd || t.seq_ids.size() != 1) {
+            LLAMA_LOG_ERROR("%s: an earlier stage takes token ids of one sequence each (entry %d)\n", __func__, i);
+            return -1;
+        }
+        tok[i] = t.id;
+        pos[i] = t.pos[0];
+        seq[i] = *t.seq_ids.begin();
+    }
+    input_rows.resize((size_t) n * width);
+    if (!input_rows_cb(input_rows_user, n, tok.data(), pos.data(), seq.data(), input_rows.data(), width)) {
+        LLAMA_LOG_ERROR("%s: the earlier stage gave no rows for %d tokens\n", __func__, n);
+        return -1;
+    }
+    llama_batch_ext rows = batch_inp;
+    rows.embd = input_rows;
+    rows.n_embd = (size_t) width;
+    for (int32_t i = 0; i < n; ++i) {
+        auto & t = rows.tokens[i];
+        t.id = LLAMA_TOKEN_NULL;
+        t.has_embd = true;
+        t.embd_off = (size_t) i * width;
+    }
+    return decode(rows);
+}
+
+void llama_context::set_input_rows_cb(llama_input_rows_cb cb, void * user) {
+    input_rows_cb = cb;
+    input_rows_user = user;
+}
+
+void llama_context::set_memory_op_cb(llama_memory_op_cb cb, void * user) {
+    if (!memory) {
+        return;
+    }
+    if (auto * mirrored = dynamic_cast<llama_memory_mirrored *>(memory.get())) {
+        mirrored->cb = cb;
+        mirrored->user = user;
+    } else if (cb) {
+        memory.reset(new llama_memory_mirrored(std::move(memory), cb, user));
+    }
+}
+
+void llama_set_input_rows_cb(llama_context * ctx, llama_input_rows_cb cb, void * user) {
+    ctx->set_input_rows_cb(cb, user);
+}
+
+int32_t llama_input_rows_width(const llama_context * ctx) {
+    return (int32_t) ctx->get_model().hparams.n_embd_out();
+}
+
+void llama_set_memory_op_cb(llama_context * ctx, llama_memory_op_cb cb, void * user) {
+    ctx->set_memory_op_cb(cb, user);
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {

@@ -108,6 +108,8 @@ add_library(${TARGET}
     sampling.cpp
     sampling.h
     speculative.cpp
+    stage-link.cpp
+    stage-link.h
     speculative.h
     subproc.cpp
     subproc.h

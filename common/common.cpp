@@ -4,6 +4,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "stage-link.h"
 
 #include "../src/llama-ext.h"
 
@@ -1231,6 +1232,9 @@ struct common_init_result::impl {
 
     common_threadpools threadpools;
 
+    // the link to an earlier stage (params.stage_prev); outlives the context, whose memory calls it
+    std::unique_ptr<stage_link::client> stage;
+
     llama_model_ptr   model;
     llama_context_ptr context;
 
@@ -1479,6 +1483,37 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+
+    if (!params.stage_prev.empty()) {
+        // the earlier stage may still be loading its layers: wait for it (LLAMA_STAGE_WAIT seconds, 1800 by default)
+        // a middle stage serves the next stage with LLAMA_STAGE_TOKEN and reaches the earlier one with its own token
+        const char * token = getenv("LLAMA_STAGE_PREV_TOKEN") ? getenv("LLAMA_STAGE_PREV_TOKEN") : getenv("LLAMA_STAGE_TOKEN");
+        const char * wait_env = getenv("LLAMA_STAGE_WAIT");
+        const int wait_s = wait_env ? atoi(wait_env) : 1800;
+        pimpl->stage = std::make_unique<stage_link::client>();
+        std::string err;
+        bool connected = false;
+        for (int waited = 0; ; waited += 2) {
+            if (pimpl->stage->connect(params.stage_prev, token ? token : "", err)) {
+                connected = true;
+                break;
+            }
+            if (waited >= wait_s) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        if (!connected || pimpl->stage->width() != llama_input_rows_width(lctx)) {
+            COM_ERR("the earlier stage at %s: %s\n", params.stage_prev.c_str(),
+                    connected ? "its rows are not this model's input width" : err.c_str());
+            pimpl->context.reset();
+            pimpl->stage.reset();
+            return;
+        }
+        pimpl->stage->attach(lctx);
+        LOG_INF("%s: the earlier stage at %s hands on rows of %d floats\n", __func__, params.stage_prev.c_str(),
+                pimpl->stage->width());
+    }
 
     set_process_priority(params.cpuparams.priority);
 

@@ -732,6 +732,10 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+
+    // a model split by layers across processes (common/stage-link.h); the token comes from LLAMA_STAGE_TOKEN
+    std::string stage_prev;    // HOST:PORT of the earlier stage this one takes its input rows from
+    std::string stage_serve;   // HOST:PORT this stage serves the next one on (llama-stage-server)
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;
